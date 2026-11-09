@@ -1,0 +1,6 @@
+/mailq
+/fakesmtp
+*.test
+*.out
+.env
+.DS_Store

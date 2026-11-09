@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mailq
+      POSTGRES_PASSWORD: mailq
+      POSTGRES_DB: mailq
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mailq"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # Catches everything sent to *@mailpit.test. Web UI: http://localhost:8025
+  mailpit:
+    image: axllent/mailpit:latest
+    ports: ["8025:8025", "1025:1025"]
+
+  # Misbehaving server for *@fake.test (bounces, deferrals, 421 throttling).
+  fakesmtp:
+    build: .
+    entrypoint: ["/usr/local/bin/fakesmtp", "-addr", ":2525", "-rate", "5", "-flaky", "2"]
+    ports: ["2525:2525"]
+
+  mailq:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+      fakesmtp:
+        condition: service_started
+    environment:
+      MAILQ_DATABASE_URL: postgres://mailq:mailq@postgres:5432/mailq?sslmode=disable
+      MAILQ_ROUTES: mailpit.test=mailpit:1025,fake.test=fakesmtp:2525
+      MAILQ_ALLOW_MX: "false"
+      # Short timings so the demo shows retries and expiry in seconds.
+      MAILQ_RETRY_SCHEDULE: 2s,4s,8s
+      MAILQ_MAX_AGE: 30s
+      MAILQ_DOMAIN_RATE: "10"
+      MAILQ_DOMAIN_BURST: "10"
+      MAILQ_DOMAIN_CONCURRENCY: "4"
+    ports: ["8080:8080"]
