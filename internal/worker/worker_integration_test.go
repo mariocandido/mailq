@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/mariocandido/mailq/internal/backoff"
 	"github.com/mariocandido/mailq/internal/classify"
@@ -151,5 +153,123 @@ func TestPipeline(t *testing.T) {
 	}
 	if fake.Delivered() != 2 {
 		t.Errorf("fake server accepted %d messages, want 2", fake.Delivered())
+	}
+}
+
+// A burst to one slow domain must wait in memory, not bounce back and forth
+// through Postgres, and must not hold up mail for other domains.
+func TestThrottledBurstWaitsInMemory(t *testing.T) {
+	url := os.Getenv("MAILQ_TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("MAILQ_TEST_DATABASE_URL not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	st, err := store.Open(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool().Exec(ctx, `TRUNCATE messages, attempts, suppressions CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	fake := &fakesmtp.Server{Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	go fake.Serve(ln) //nolint:errcheck
+
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	w := &Worker{
+		Store: st,
+		Client: &smtpclient.Client{
+			Router: &smtpclient.StaticRouter{Routes: map[string]string{
+				"slow.test": ln.Addr().String(), "fast.test": ln.Addr().String(),
+			}},
+			Timeout: 5 * time.Second,
+		},
+		Classifier: classify.Default(),
+		Limiter: throttle.New(throttle.Config{
+			Rate: 100, Burst: 100, Overrides: map[string]float64{"slow.test": 10},
+		}),
+		Backoff:          backoff.Default(),
+		Metrics:          m,
+		Log:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Concurrency:      8,
+		MaxHeldPerDomain: 4,
+		PollInterval:     20 * time.Millisecond,
+	}
+
+	// 20 messages to slow.test (10/s, burst of 100 tokens drained below)
+	// queued before 5 to fast.test.
+	var in []store.NewMessage
+	for i := range 20 {
+		in = append(in, store.NewMessage{From: "me@test.local", To: fmt.Sprintf("s%d@slow.test", i), Domain: "slow.test", Subject: "s", Body: "b"})
+	}
+	if _, err := st.Enqueue(ctx, "", in); err != nil {
+		t.Fatal(err)
+	}
+	in = nil
+	for i := range 5 {
+		in = append(in, store.NewMessage{From: "me@test.local", To: fmt.Sprintf("f%d@fast.test", i), Domain: "fast.test", Subject: "s", Body: "b"})
+	}
+	if _, err := st.Enqueue(ctx, "", in); err != nil {
+		t.Fatal(err)
+	}
+	// Drain slow.test's burst so that it really is throttled at 10/s.
+	w.Limiter.OnRateLimited("slow.test")
+	w.Limiter.OnRateLimited("slow.test") // now 2.5/s
+
+	wctx, stop := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { _ = w.Run(wctx); close(done) }()
+
+	count := func(domain string) int {
+		var n int
+		if err := st.Pool().QueryRow(ctx, `SELECT count(*) FROM messages WHERE domain = $1 AND status = 'delivered'`, domain).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	// fast.test is not stuck behind slow.test's line.
+	deadline := time.Now().Add(3 * time.Second)
+	for count("fast.test") < 5 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if n := count("fast.test"); n != 5 {
+		t.Fatalf("fast.test delivered %d of 5 while slow.test was throttled", n)
+	}
+	if n := count("slow.test"); n >= 20 {
+		t.Fatalf("slow.test delivered %d already; the test needs it to be throttled", n)
+	}
+
+	deadline = time.Now().Add(20 * time.Second)
+	for count("slow.test") < 20 && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	stop()
+	<-done
+
+	if n := count("slow.test"); n != 20 {
+		t.Fatalf("slow.test delivered %d of 20", n)
+	}
+	if n := testutil.ToFloat64(m.Requeued.WithLabelValues("slow.test", "lease")); n != 0 {
+		t.Errorf("%v messages went back to Postgres, want 0", n)
+	}
+	var attempts int
+	if err := st.Pool().QueryRow(ctx, `SELECT count(*) FROM attempts`).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 25 || fake.Delivered() != 25 {
+		t.Errorf("attempts=%d delivered=%d, want 25 each (throttling must not cost attempts)", attempts, fake.Delivered())
 	}
 }

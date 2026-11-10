@@ -184,18 +184,25 @@ func (s *Store) Enqueue(ctx context.Context, key string, msgs []NewMessage) ([]M
 
 // Claim leases up to limit messages that are due. Messages whose lease
 // expired (worker crashed mid-delivery) are reclaimed too.
-func (s *Store) Claim(ctx context.Context, limit int, lease time.Duration) ([]Message, error) {
+//
+// Messages for the domains in skip are left in the queue: the worker already
+// holds enough of them in memory, waiting for the domain's throttle.
+func (s *Store) Claim(ctx context.Context, limit int, lease time.Duration, skip []string) ([]Message, error) {
+	if skip == nil {
+		skip = []string{} // NULL would make `<> ALL` exclude every row
+	}
 	rows, err := s.pool.Query(ctx, `
 		UPDATE messages
 		SET status = 'sending', locked_until = now() + make_interval(secs => $2), updated_at = now()
 		WHERE id IN (
 			SELECT id FROM messages
-			WHERE (status IN ('queued', 'deferred') AND next_attempt_at <= now())
-			   OR (status = 'sending' AND locked_until < now())
+			WHERE ((status IN ('queued', 'deferred') AND next_attempt_at <= now())
+			       OR (status = 'sending' AND locked_until < now()))
+			  AND domain <> ALL($3::text[])
 			ORDER BY next_attempt_at
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED)
-		RETURNING `+msgCols, limit, lease.Seconds())
+		RETURNING `+msgCols, limit, lease.Seconds(), skip)
 	if err != nil {
 		return nil, err
 	}

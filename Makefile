@@ -2,7 +2,7 @@
 # running mailq container must not pick up the test's messages.
 TEST_DB ?= postgres://mailq:mailq@localhost:5432/mailq_test?sslmode=disable
 
-.PHONY: up down logs test itest demo build
+.PHONY: up down logs test itest demo burst build
 
 up: ## start postgres, mailpit, fakesmtp and mailq
 	docker compose up -d --build
@@ -26,3 +26,6 @@ itest: ## unit + integration tests against the compose postgres
 
 demo:
 	./scripts/demo.sh
+
+burst: ## 40 messages to one throttled domain; prints the Postgres cost
+	./scripts/burst.sh
